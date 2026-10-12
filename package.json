@@ -34,7 +34,8 @@
   ],
   "pi": {
     "extensions": [
-      "./extensions/auto-mode.ts"
+      "./extensions/auto-mode.ts",
+      "./extensions/pi-automode-te-ext/index.ts"
     ],
     "skills": [
       "./skills"

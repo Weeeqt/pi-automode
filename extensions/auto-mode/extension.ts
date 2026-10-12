@@ -63,6 +63,7 @@ import {
   statusText,
 } from "./state.ts";
 import { loadedContextFromSystemPromptOptions } from "./transcript.ts";
+import { requestClassifierBlockDecision } from "./te-ext-hook.ts";
 import type {
   AutoModeState,
   ClassifierReasoningLog,
@@ -339,6 +340,7 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
       ctx: ExtensionContext,
       denial: DenialRecord,
       logCtx: LogCtx,
+      modelReason?: string,
     ): { block: true; reason: string } {
       state.blockedActions += 1;
       state.lastDecision = "block";
@@ -370,7 +372,7 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
       }
       return {
         block: true,
-        reason: blockedToolReason(denial.reason),
+        reason: modelReason ?? blockedToolReason(denial.reason),
       };
     }
 
@@ -746,13 +748,45 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         );
       }
 
-      const decision = await classify(
-        ctx,
-        cfg,
-        serializeClassifierAction(event.toolName, input),
-        loadedContext,
-      );
+      const classifierAction = serializeClassifierAction(event.toolName, input);
+      let decision = await classify(ctx, cfg, classifierAction, loadedContext);
       logClassifierIo(decision, logCtx);
+      // [pi-automode-te-ext] Optional listener: retry, allow once, or deny.
+      let modelReason: string | undefined;
+      for (let attempt = 1; decision.decision !== "allow"; attempt += 1) {
+        const answer = await requestClassifierBlockDecision(
+          (name, data) => pi.events?.emit(name, data),
+          {
+            toolName: event.toolName,
+            toolCallId: event.toolCallId,
+            action: summary,
+            result: decision,
+            attempt,
+            signal: ctx.signal,
+          },
+        );
+        if (answer.action === "retry") {
+          decision = await classify(ctx, cfg, classifierAction, loadedContext);
+          logClassifierIo(decision, logCtx);
+          continue;
+        }
+        if (answer.action === "allow-once") {
+          state.classifierAllowed += 1;
+          return allow(
+            ctx,
+            "classifier",
+            `Allowed once by user after auto-mode review: ${decision.reason}`,
+            event.toolName,
+            summary,
+            logCtx,
+          );
+        }
+        if (answer.action === "disable-and-deny") {
+          state.enabledOverride = false;
+        }
+        modelReason = answer.message;
+        break;
+      }
       if (decision.decision === "allow") {
         state.classifierAllowed += 1;
         return allow(
@@ -772,7 +806,7 @@ export function createPiAutomode(options: PiAutomodeOptions = {}) {
         reason: decision.reason,
         action: summary,
         kind: "classifier",
-      }, logCtx);
+      }, logCtx, modelReason);
     });
 
     pi.registerTool({
